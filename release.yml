@@ -1,0 +1,152 @@
+name: Release Windows signée
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Construire et publier Vaultly
+    runs-on: windows-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+      TAURI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+      TAURI_UPDATER_BASE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Installer Rust stable MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      - name: Vérifier la version du tag
+        shell: pwsh
+        run: |
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$packageVersion" -ne $env:GITHUB_REF_NAME) {
+            throw "Le tag $env:GITHUB_REF_NAME ne correspond pas à la version v$packageVersion de package.json."
+          }
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($tauriVersion -ne $packageVersion) {
+            throw "La version Tauri $tauriVersion ne correspond pas à la version package.json $packageVersion."
+          }
+
+      - name: Exécuter les tests et validations
+        shell: pwsh
+        run: |
+          npm run build
+          node --check browser-extension/content.js
+          node --check release/prepare-updater-config.mjs
+          node --check release/create-latest-manifest.mjs
+          cargo test --manifest-path src-tauri/Cargo.toml --quiet
+
+      - name: Vérifier les secrets requis
+        shell: pwsh
+        run: |
+          $required = @(
+            'TAURI_SIGNING_PRIVATE_KEY',
+            'TAURI_UPDATER_PUBLIC_KEY',
+            'SIGNPATH_API_TOKEN',
+            'SIGNPATH_ORGANIZATION_ID',
+            'SIGNPATH_PROJECT_SLUG',
+            'SIGNPATH_SIGNING_POLICY_SLUG'
+          )
+          foreach ($name in $required) {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "Env:$name").Value)) {
+              throw "$name est absent des secrets GitHub."
+            }
+          }
+
+      - name: Préparer la configuration updater
+        shell: pwsh
+        run: npm run prepare:updater
+
+      - name: Construire l'artefact non signé
+        shell: pwsh
+        run: npm run tauri:build -- --config src-tauri/tauri.release.conf.json
+
+      - name: Déposer l'installeur non signé
+        id: upload-unsigned-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultly-installer-${{ github.run_id }}
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          archive: false
+          retention-days: 1
+
+      - name: Faire signer l'installeur avec SignPath
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}\vaultly-signed
+          skip-decompress: true
+
+      - name: Remplacer l'installeur par sa version signée
+        shell: pwsh
+        run: |
+          $signed = Get-ChildItem -LiteralPath "$env:RUNNER_TEMP\vaultly-signed" -Filter '*-setup.exe' -File | Select-Object -First 1
+          if ($null -eq $signed) { throw 'SignPath n''a pas retourné d''installeur signé.' }
+          $target = Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' -File | Select-Object -First 1
+          if ($null -eq $target) { throw 'L''installeur Tauri original est introuvable.' }
+          Copy-Item -LiteralPath $signed.FullName -Destination $target.FullName -Force
+
+      - name: Réintégrer l'installeur signé dans le bundle updater
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*.nsis.zip' -File | Select-Object -First 1
+          if ($null -eq $zip) { throw 'Le bundle updater .nsis.zip est introuvable.' }
+          $unpacked = Join-Path $env:RUNNER_TEMP 'vaultly-updater-payload'
+          $repacked = Join-Path $env:RUNNER_TEMP 'vaultly-updater-repacked.nsis.zip'
+          New-Item -ItemType Directory -Path $unpacked -Force | Out-Null
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $unpacked -Force
+          $innerInstaller = Get-ChildItem -LiteralPath $unpacked -Filter '*-setup.exe' -File | Select-Object -First 1
+          if ($null -eq $innerInstaller) { throw 'L''installeur n''a pas été trouvé dans le bundle updater.' }
+          $signed = Get-ChildItem -LiteralPath "$env:RUNNER_TEMP\vaultly-signed" -Filter '*-setup.exe' -File | Select-Object -First 1
+          Copy-Item -LiteralPath $signed.FullName -Destination $innerInstaller.FullName -Force
+          Compress-Archive -Path (Join-Path $unpacked '*') -DestinationPath $repacked -Force
+          Move-Item -LiteralPath $repacked -Destination $zip.FullName -Force
+          Remove-Item -LiteralPath "$($zip.FullName).sig" -Force -ErrorAction SilentlyContinue
+          npx tauri signer sign -k "$env:TAURI_SIGNING_PRIVATE_KEY" -p "$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$($zip.FullName)"
+
+      - name: Vérifier les artefacts signés
+        shell: pwsh
+        run: npm run release:verify
+
+      - name: Publier la release GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            src-tauri/target/release/bundle/nsis/*.nsis.zip
+            src-tauri/target/release/bundle/nsis/*.nsis.zip.sig
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            release/latest.json

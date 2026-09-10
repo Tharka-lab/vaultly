@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+*.key
+*.key.pub
+*.sig
+.env*
+release/latest.json
+src-tauri/tauri.release.conf.json

@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Vaultly — Autoremplissage local",
+  "version": "0.1.0",
+  "description": "Autoremplissage local connecté au coffre Vaultly déverrouillé.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "options_page": "options.html",
+  "action": { "default_title": "Configurer Vaultly" },
+  "content_scripts": [{ "matches": ["<all_urls>"], "js": ["content.js"], "run_at": "document_idle" }]
+}
